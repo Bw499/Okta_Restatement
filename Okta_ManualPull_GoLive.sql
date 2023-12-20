@@ -1,7 +1,23 @@
 MODULE "/shares/IDEAs.Prod.Data/Publish/Profiles/Tenant/Commercial/IDEAsTenantProfile/Resources/v4/IDEAsTenantProfileExtension_v2.module" AS IDEAsTenantProfileExtensionModule;
 
-#DECLARE DetectionDate DateTime = DateTime.Parse("2023-11-30");
-#DECLARE windowStart DateTime = DateTime.Parse("2023-11-29");
+#DECLARE DetectionDate DateTime = DateTime.Parse("2023-10-31");
+
+#IF ("@@DaysToSubtract@@".StartsWith("@@"))
+    #DECLARE DaysToSubtract int = -27; // -27 for RL28, -6 for RL7, -0 for Daily 
+#ELSE
+    #DECLARE DaysToSubtract int = @@DaysToSubtract@@; // -27 for RL28, -6 for RL7, -0 for Daily 
+#ENDIF
+#IF ("@@SliceStartTime@@".StartsWith("@@"))
+    #DECLARE SliceStartTime string = "2023-10-31";
+#ELSE
+    #DECLARE SliceStartTime string = "@@SliceStartTime@@";
+#ENDIF
+
+#DECLARE windowStart DateTime = DateTimeOffset.Parse(@SliceStartTime).DateTime;
+#DECLARE windowEnd DateTime = DateTimeOffset.Parse(@SliceStartTime).DateTime;
+#DECLARE AADAuthFed_windowStart DateTime = new DateTimeOffset(@windowStart).UtcDateTime;
+#DECLARE AADAuthFed_windowEnd DateTime = new DateTimeOffset(@windowEnd).Add(TimeSpan.Parse("-00:01:00")).UtcDateTime;
+
 #DECLARE FederationCounts_windowStart DateTime = new DateTimeOffset(@windowStart).UtcDateTime;
 #DECLARE IDEAsTenantProfileExtension_windowStart DateTime = new DateTimeOffset(@windowStart).UtcDateTime;
 
@@ -31,9 +47,8 @@ IDEAsTenantsProfile =
 TenantTPId =
     SELECT TenantId.ToUpper() AS TenantId,
            MSSalesTopParentOrgId AS TPID,
-           MIN(CustomerSegmentGroup) AS CustomerSegmentGroup
+           CustomerSegmentGroup
     FROM IDEAsTenantsProfile;
-
 
 // SegmentDerived
 TPIDAttributes =
@@ -87,25 +102,82 @@ FortuneFlagsProfile =
     );
 
 // FederationCounts -- Okta Federation, Ping Federation, etc. by TPID
-FederationCounts =
-    SELECT FactDate,
-           ContextId,
-           AuthType,
-           StsProduct,
-           ConfiguredUserCount,
-           UniqueActiveUserCount,
-           SuccessfulAuthCount
-    FROM
-    (
-        VIEW "/shares/IDEAs.Prod.Data/Publish/Usage/User/Neutral/Reporting/ExternalViews/FederationCounts/Views/v1/FederationCounts.view"
-        PARAMS
+#IF(new DateTimeOffset(@windowStart) < DateTimeOffset.Parse("2023-09-07T00:00:00Z"))
+    FederationCounts =
+        SELECT FactDate,
+               ContextId,
+               AuthType,
+               StsProduct,
+               ConfiguredUserCount,
+               UniqueActiveUserCount,
+               SuccessfulAuthCount
+        FROM
         (
-            EndDate = @FederationCounts_windowStart
-        )
-    );
+            VIEW "/shares/IDEAs.Prod.Data/Publish/Usage/User/Neutral/Reporting/ExternalViews/FederationCounts/Views/v1/FederationCounts.view"
+            PARAMS
+            (
+                EndDate = @FederationCounts_windowStart
+            )
+        );
+#ELSE
+    FederationCounts =
+        SELECT default(DateTime) AS FactDate,
+               default(Guid?) AS ContextId,
+               default(string) AS AuthType,
+               default(string) AS StsProduct,
+               default(long) AS ConfiguredUserCount,
+               default(long) AS UniqueActiveUserCount,
+               default(long) AS SuccessfulAuthCount
+        FROM
+        (
+            VALUES(0)
+        ) AS _
+        WHERE false;
+#ENDIF
 
-FederationCounts =  SELECT *.Except(ContextId), ContextId.ToString().ToUpper() AS TenantId
+#IF(new DateTimeOffset(@windowStart) >= DateTimeOffset.Parse("2023-09-07T00:00:00Z"))
+    AADAuthFed =
+        SELECT FactDate,
+               TenantId,
+               AuthType,
+               StsProduct,
+               ConfiguredUserCount,
+               UniqueActiveUserCount,
+               SuccessfulAuthCount
+        FROM
+        (
+            VIEW "/shares/IDEAs.Prod.Data/Publish/Usage/User/Commercial/ActionView/AADAuthFed/Views/v1/AADAuthFed.view"
+            PARAMS
+            (
+                SnapshotTime = @AADAuthFed_windowStart
+            )
+        );
+#ELSE
+    AADAuthFed =
+        SELECT default(DateTime) AS FactDate,
+               default(string) AS TenantId,
+               default(string) AS AuthType,
+               default(string) AS StsProduct,
+               default(long?) AS ConfiguredUserCount,
+               default(long) AS UniqueActiveUserCount,
+               default(long?) AS SuccessfulAuthCount
+        FROM
+        (
+            VALUES(0)
+        ) AS _
+        WHERE false;
+#ENDIF
+
+
+#IF(new DateTimeOffset(@windowStart) >= DateTimeOffset.Parse("2023-09-07T00:00:00Z").UtcDateTime)
+    FederationCounts =  SELECT *.Except(TenantId), TenantId.ToUpper() AS TenantId
+                    FROM AADAuthFed;
+#ELSE
+    FederationCounts =  SELECT *.Except(ContextId), ContextId.ToString().ToUpper() AS TenantId
                     FROM FederationCounts;
+#ENDIF
+
+
 
 FederationCounts =
     SELECT TPID,
@@ -127,7 +199,7 @@ TenantTPId =
            IF(TenantTPId.CustomerSegmentGroup == "SMC - SMB", "SMB", "Others"))))) AS SegmentDerived,
            AreaName,
            IF(TPName != NULL, TPName.Replace(",", ""), NULL) AS TPName
-    FROM TenantTPId
+    FROM (SELECT TPID, MIN(CustomerSegmentGroup) AS CustomerSegmentGroup FROM TenantTPId) AS TenantTPId
     LEFT OUTER JOIN
         TPIDAttributes AS TPID
         ON TenantTPId.TPID == TPID.TPID;
@@ -268,6 +340,88 @@ output =
 
 
 
-#DECLARE OutputStream1 string = string.Format("/local/users/beca/Okta/managed_Okta_{0}_{1}_{2}.ss", @windowStart.Year.ToString(), @windowStart.Month.ToString("D2"), @windowStart.Day.ToString("D2"));
+#DECLARE OutputStream1 string = string.Format("/local/users/beca/Okta/new_managed_Okta_{0}_{1}_{2}.ss", @windowStart.Year.ToString(), @windowStart.Month.ToString("D2"), @windowStart.Day.ToString("D2"));
 OUTPUT output
-TO SSTREAM @OutputStream1; 
+TO SSTREAM @OutputStream1;
+
+
+
+output_agg =
+    SELECT COUNT (DISTINCT TPID) AS TotalAllAccounts,
+           COUNT(DISTINCT (IsTPIDOkta == true? TPID : null)) AS TPIDOktaAllAccounts,
+           COUNT(DISTINCT (IsAADPPAU == true? TPID : null)) AS AADPPaidAllAccounts,
+           COUNT(DISTINCT (IsAADPPAU25 == true? TPID : null)) AS AADPPaid25AllAccounts,
+           COUNT(DISTINCT (IsAADPPAU250 == true? TPID : null)) AS AADPPaid250AllAccounts,
+           COUNT(DISTINCT (IsAADPPAU500 == true? TPID : null)) AS AADPPaid500AllAccounts,
+           COUNT(DISTINCT (IsNativeAAD == true? TPID : null)) AS NativeAADAllAccounts,
+           COUNT(DISTINCT (IsADFS == true? TPID : null)) AS ADFSAllAccounts,
+           COUNT(DISTINCT (IsOkta == true? TPID : null)) AS OktaAllAccounts,
+           COUNT(DISTINCT (IsPing == true? TPID : null)) AS PingAllAccounts
+    FROM output;
+             
+             
+//#DECLARE OutputStream2 string = string.Format("/local/users/beca/Okta/agg_managed_Okta_{0}_{1}_{2}.ss", @windowStart.Year.ToString(), @windowStart.Month.ToString("D2"), @windowStart.Day.ToString("D2"));
+//OUTPUT output_agg
+//TO SSTREAM @OutputStream2;
+
+
+
+
+output_agg_US =
+    SELECT COUNT(DISTINCT TPID) AS TotalAllAccounts,
+           COUNT(DISTINCT (IsTPIDOkta == true? TPID : null)) AS TPIDOktaAllAccounts,
+           COUNT(DISTINCT (IsAADPPAU == true? TPID : null)) AS AADPPaidAllAccounts,
+           COUNT(DISTINCT (IsAADPPAU25 == true? TPID : null)) AS AADPPaid25AllAccounts,
+           COUNT(DISTINCT (IsAADPPAU250 == true? TPID : null)) AS AADPPaid250AllAccounts,
+           COUNT(DISTINCT (IsAADPPAU500 == true? TPID : null)) AS AADPPaid500AllAccounts,
+           COUNT(DISTINCT (IsNativeAAD == true? TPID : null)) AS NativeAADAllAccounts,
+           COUNT(DISTINCT (IsADFS == true? TPID : null)) AS ADFSAllAccounts,
+           COUNT(DISTINCT (IsOkta == true? TPID : null)) AS OktaAllAccounts,
+           COUNT(DISTINCT (IsPing == true? TPID : null)) AS PingAllAccounts
+    FROM output
+    WHERE AreaName == "United States";
+             
+             
+//#DECLARE OutputStream3 string = string.Format("/local/users/beca/Okta/agg_US_managed_Okta_{0}_{1}_{2}.ss", @windowStart.Year.ToString(), @windowStart.Month.ToString("D2"), @windowStart.Day.ToString("D2"));
+//OUTPUT output_agg_US
+//TO SSTREAM @OutputStream3;
+
+
+
+output_agg_F500 =
+    SELECT COUNT(DISTINCT TPID) AS TotalAllAccounts,
+           COUNT(DISTINCT (IsTPIDOkta == true? TPID : null)) AS TPIDOktaAllAccounts,
+           COUNT(DISTINCT (IsAADPPAU == true? TPID : null)) AS AADPPaidAllAccounts,
+           COUNT(DISTINCT (IsAADPPAU25 == true? TPID : null)) AS AADPPaid25AllAccounts,
+           COUNT(DISTINCT (IsAADPPAU250 == true? TPID : null)) AS AADPPaid250AllAccounts,
+           COUNT(DISTINCT (IsAADPPAU500 == true? TPID : null)) AS AADPPaid500AllAccounts,
+           COUNT(DISTINCT (IsNativeAAD == true? TPID : null)) AS NativeAADAllAccounts,
+           COUNT(DISTINCT (IsADFS == true? TPID : null)) AS ADFSAllAccounts,
+           COUNT(DISTINCT (IsOkta == true? TPID : null)) AS OktaAllAccounts,
+           COUNT(DISTINCT (IsPing == true? TPID : null)) AS PingAllAccounts
+    FROM output
+    WHERE IsF500 == true;
+             
+             
+//#DECLARE OutputStream4 string = string.Format("/local/users/beca/Okta/agg_F500_managed_Okta_{0}_{1}_{2}.ss", @windowStart.Year.ToString(), @windowStart.Month.ToString("D2"), @windowStart.Day.ToString("D2"));
+//OUTPUT output_agg_F500
+//TO SSTREAM @OutputStream4;
+
+
+
+output_agg =
+    SELECT *
+    FROM
+    (
+    SELECT *
+    FROM output_agg_WW
+    UNION ALL
+    SELECT *
+    FROM output_agg_US
+UNION ALL
+SELECT * FROM output_agg_F500
+    );
+
+#DECLARE OutputStream4 string = string.Format("/local/users/beca/Okta/agg_managed_Okta_{0}_{1}_{2}.ss", @windowStart.Year.ToString(), @windowStart.Month.ToString("D2"), @windowStart.Day.ToString("D2"));
+OUTPUT output_agg
+TO SSTREAM @OutputStream4;
